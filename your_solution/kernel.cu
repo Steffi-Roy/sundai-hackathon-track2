@@ -3,181 +3,397 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 
-// INT4 Quantization Kernel
+// ---- Configuration ----
+static constexpr int BLOCK_M    = 128;
+static constexpr int BLOCK_N    = 256;   // Phase 4: doubled from 128
+static constexpr int BLOCK_K    = 64;
+static constexpr int WARP_SZ    = 32;
+static constexpr int NUM_WARPS  = 8;
+static constexpr int WARP_M     = BLOCK_M / NUM_WARPS;  // 16
+static constexpr int TILES_N    = BLOCK_N / 16;          // 16
+static constexpr int NUM_STAGES = 3;
 
-// Each thread handles one group of `group_size` elements in one row.
-// Performs per-group symmetric quantization: scale = max(|x|) / 7
-// Packs two signed INT4 values per byte: low nibble = even element, high nibble = odd element.
-__global__ void quantize_int4_kernel(
-    const half* __restrict__ input,   // [M, K]
-    uint8_t* __restrict__ output,     // [M, K/2]
-    half* __restrict__ scales,        // [M, num_groups]
-    int M,
-    int K,
-    int group_size
+// Shared memory stride: K/2 bytes + padding (must be 16-byte aligned for cp.async)
+static constexpr int SMEM_STRIDE = BLOCK_K / 2 + 16;   // 48 bytes per row
+
+// Phase 2: scale staging constants
+static constexpr int SCALE_A_STRIDE = BLOCK_M;   // FP16 elements in smA per stage
+static constexpr int SCALE_B_STRIDE = BLOCK_N;   // FP16 elements in smB per stage
+
+// ── Quantize kernel configuration ──
+static constexpr int WARPS_PER_BLOCK_Q = 8;
+static constexpr int GROUPS_PER_WARP   = 4;
+static constexpr int THREADS_PER_GROUP = WARP_SZ / GROUPS_PER_WARP;  // 8
+
+// ── Optimized activation INT4 quantization kernel ─────────────────────────
+// float4 loads (8 halves/thread), 4 groups/warp, 3-step sub-group reduction
+// Scales stored in transposed [num_groups, M] layout for coalesced GEMM reads
+// group_size must be 64 (8 threads × 8 halves)
+__global__ void quantize_int4_opt_kernel(
+    const half*  __restrict__ input,
+    const half*  __restrict__ smooth,
+    uint8_t*     __restrict__ output,
+    half*        __restrict__ scales,  // [num_groups, M] transposed
+    int M, int K, int group_size
 ) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int group = blockIdx.y;
+    const int warpId        = threadIdx.x / WARP_SZ;
+    const int lane          = threadIdx.x % WARP_SZ;
+    const int group_in_warp = lane / THREADS_PER_GROUP;   // 0..3
+    const int lane_in_group = lane % THREADS_PER_GROUP;   // 0..7
 
-    if (row >= M) return;
+    const int row    = blockIdx.x;
+    const int g_base = (blockIdx.y * WARPS_PER_BLOCK_Q + warpId) * GROUPS_PER_WARP;
+    const int g      = g_base + group_in_warp;
+    if (g >= K / group_size) return;
+    const int k0 = g * group_size;
 
-    int num_groups = K / group_size;
-    int k_start = group * group_size;
+    // float4 load: 16 bytes = 8 half values per thread
+    const float4* ptr4 = reinterpret_cast<const float4*>(
+        input + row * K + k0 + lane_in_group * 8);
+    float4 chunk = *ptr4;
 
-    // Step 1: Find max absolute value in this group
-    float max_abs = 0.0f;
-    for (int i = 0; i < group_size; i++) {
-        float val = __half2float(input[row * K + k_start + i]);
-        float abs_val = fabsf(val);
-        if (abs_val > max_abs) max_abs = abs_val;
+    half2 p0 = *reinterpret_cast<const half2*>(&chunk.x);
+    half2 p1 = *reinterpret_cast<const half2*>(&chunk.y);
+    half2 p2 = *reinterpret_cast<const half2*>(&chunk.z);
+    half2 p3 = *reinterpret_cast<const half2*>(&chunk.w);
+
+    float a0 = __half2float(p0.x), a1 = __half2float(p0.y);
+    float a2 = __half2float(p1.x), a3 = __half2float(p1.y);
+    float a4 = __half2float(p2.x), a5 = __half2float(p2.y);
+    float a6 = __half2float(p3.x), a7 = __half2float(p3.y);
+
+    if (smooth != nullptr) {
+        const float4* sptr4 = reinterpret_cast<const float4*>(
+            smooth + k0 + lane_in_group * 8);
+        float4 sv = *sptr4;
+        half2 s0 = *reinterpret_cast<const half2*>(&sv.x);
+        half2 s1 = *reinterpret_cast<const half2*>(&sv.y);
+        half2 s2 = *reinterpret_cast<const half2*>(&sv.z);
+        half2 s3 = *reinterpret_cast<const half2*>(&sv.w);
+        a0 /= __half2float(s0.x); a1 /= __half2float(s0.y);
+        a2 /= __half2float(s1.x); a3 /= __half2float(s1.y);
+        a4 /= __half2float(s2.x); a5 /= __half2float(s2.y);
+        a6 /= __half2float(s3.x); a7 /= __half2float(s3.y);
     }
 
-    // Step 2: Compute scale
-    float scale = max_abs / 7.0f;
-    scales[row * num_groups + group] = __float2half(scale);
+    // Sub-group max reduction: 8 threads per group, 3 shuffles (log2(8)=3)
+    float local_max = fmaxf(fmaxf(fmaxf(fabsf(a0), fabsf(a1)),
+                            fmaxf(fabsf(a2), fabsf(a3))),
+                     fmaxf(fmaxf(fabsf(a4), fabsf(a5)),
+                            fmaxf(fabsf(a6), fabsf(a7))));
+    unsigned sub_mask = 0xFFu << (group_in_warp * THREADS_PER_GROUP);
+    for (int off = 4; off > 0; off >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor_sync(sub_mask, local_max, off));
 
-    // Step 3: Compute reciprocal scale (guard against zero)
-    float rscale = (max_abs > 0.0f) ? (7.0f / max_abs) : 0.0f;
+    float rscale = (local_max > 0.f) ? (7.5f / local_max) : 0.f;
+    // Transposed [num_groups, M] layout: consecutive m values are adjacent in memory
+    if (lane_in_group == 0)
+        scales[g * M + row] = __float2half(local_max / 7.5f);
 
-    // Step 4: Quantize and pack pairs of elements
-    int out_offset = row * (K / 2) + k_start / 2;
-    for (int i = 0; i < group_size; i += 2) {
-        float val_even = __half2float(input[row * K + k_start + i]);
-        float val_odd  = __half2float(input[row * K + k_start + i + 1]);
+    auto quant = [&](float v) -> int {
+        return max(-8, min(7, __float2int_rn(v * rscale)));
+    };
+    int q0 = quant(a0), q1 = quant(a1), q2 = quant(a2), q3 = quant(a3);
+    int q4 = quant(a4), q5 = quant(a5), q6 = quant(a6), q7 = quant(a7);
 
-        // Quantize: round to nearest, clamp to [-8, 7]
-        int q_even = __float2int_rn(val_even * rscale);
-        int q_odd  = __float2int_rn(val_odd * rscale);
+    // Pack 8 INT4 values into 1 uint32_t (4 bytes): low nibble = even index
+    uint32_t packed =
+        ((uint32_t)(q0 & 0xF))        |
+        ((uint32_t)(q1 & 0xF) << 4)   |
+        ((uint32_t)(q2 & 0xF) << 8)   |
+        ((uint32_t)(q3 & 0xF) << 12)  |
+        ((uint32_t)(q4 & 0xF) << 16)  |
+        ((uint32_t)(q5 & 0xF) << 20)  |
+        ((uint32_t)(q6 & 0xF) << 24)  |
+        ((uint32_t)(q7 & 0xF) << 28);
 
-        q_even = max(-8, min(7, q_even));
-        q_odd  = max(-8, min(7, q_odd));
-
-        // Pack: low nibble = even element, high nibble = odd element
-        uint8_t packed = (uint8_t)((q_odd & 0xF) << 4) | (uint8_t)(q_even & 0xF);
-        output[out_offset + i / 2] = packed;
-    }
+    const int out_base = row * (K / 2) + k0 / 2;
+    *reinterpret_cast<uint32_t*>(output + out_base + lane_in_group * 4) = packed;
 }
 
 std::vector<torch::Tensor> quantize_int4_custom(torch::Tensor input, int group_size) {
-    TORCH_CHECK(input.is_cuda(), "input must be a CUDA tensor");
-    TORCH_CHECK(input.dtype() == torch::kHalf, "input must be float16");
-    TORCH_CHECK(input.dim() == 2, "input must be 2D [M, K]");
+    TORCH_CHECK(input.is_cuda() && input.dtype() == torch::kHalf);
+    int M = input.size(0), K = input.size(1);
+    TORCH_CHECK(K % group_size == 0 && group_size % 2 == 0);
+    TORCH_CHECK(group_size == 64, "quantize_int4_custom requires group_size=64");
 
-    int M = input.size(0);
-    int K = input.size(1);
-
-    TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
-    TORCH_CHECK(group_size % 2 == 0, "group_size must be even");
-
-    auto output = torch::empty({M, K / 2}, torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
+    auto output = torch::empty({M, K / 2},
+        torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
     int num_groups = K / group_size;
-    auto scales = torch::empty({M, num_groups}, torch::TensorOptions().dtype(torch::kHalf).device(input.device()));
+    // Transposed layout [num_groups, M] for coalesced reads in GEMM kernel
+    auto scales = torch::empty({num_groups, M},
+        torch::TensorOptions().dtype(torch::kHalf).device(input.device()));
 
-    dim3 block(256);
-    dim3 grid((M + 255) / 256, num_groups);
+    const int groups_per_block = WARPS_PER_BLOCK_Q * GROUPS_PER_WARP;   // 32
+    dim3 grid(M, (num_groups + groups_per_block - 1) / groups_per_block);
+    dim3 block(WARP_SZ * WARPS_PER_BLOCK_Q);   // 256 threads
 
-    quantize_int4_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+    quantize_int4_opt_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+        nullptr,
         output.data_ptr<uint8_t>(),
         reinterpret_cast<half*>(scales.data_ptr<at::Half>()),
         M, K, group_size
     );
-
     return {output, scales};
 }
 
-// INT4 GEMM Kernel
 
-// Computes C[M, N] = A[M, K] @ B[N, K]^T where A and B are packed INT4 with per-group scales.
-// Each thread computes one output element.
-// Within each group, INT4 dot product is accumulated in int32, then scaled to FP32.
-__global__ void gemm_int4_kernel(
-    const uint8_t* __restrict__ A,        // [M, K/2] packed INT4 activations
-    const uint8_t* __restrict__ B,        // [N, K/2] packed INT4 weights
-    const half* __restrict__ scales_A,    // [M, num_groups]
-    const half* __restrict__ scales_B,    // [N, num_groups]
-    half* __restrict__ C,                 // [M, N] output
-    int M,
-    int N,
-    int K,
-    int group_size
-) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (row >= M || col >= N) return;
-
-    int num_groups = K / group_size;
-    int half_group = group_size / 2;  // number of packed bytes per group
-
-    float acc = 0.0f;
-
-    for (int g = 0; g < num_groups; g++) {
-        float sa = __half2float(scales_A[row * num_groups + g]);
-        float sb = __half2float(scales_B[col * num_groups + g]);
-
-        int dot = 0;
-        int byte_base = g * half_group;
-
-        for (int b = 0; b < half_group; b++) {
-            uint8_t a_packed = A[row * (K / 2) + byte_base + b];
-            uint8_t b_packed = B[col * (K / 2) + byte_base + b];
-
-            // Unpack low nibble (even element) with sign extension
-            int a_lo = (int)(a_packed & 0xF);
-            if (a_lo >= 8) a_lo -= 16;
-            int b_lo = (int)(b_packed & 0xF);
-            if (b_lo >= 8) b_lo -= 16;
-
-            // Unpack high nibble (odd element) with sign extension
-            int a_hi = (int)((a_packed >> 4) & 0xF);
-            if (a_hi >= 8) a_hi -= 16;
-            int b_hi = (int)((b_packed >> 4) & 0xF);
-            if (b_hi >= 8) b_hi -= 16;
-
-            dot += a_lo * b_lo + a_hi * b_hi;
-        }
-
-        acc += sa * sb * (float)dot;
-    }
-
-    C[row * N + col] = __float2half(acc);
+// ---- MMA wrapper: m16n8k64 INT4×INT4 → INT32 ----
+__device__ __forceinline__ void mma_s4(uint4 a, uint2 b, int (&c)[4]) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
+        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
+        : "+r"(c[0]),"+r"(c[1]),"+r"(c[2]),"+r"(c[3])
+        : "r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b.x),"r"(b.y));
+#else
+    asm volatile("{"
+        ".reg .b32 t0,t1,t2,t3;\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {t0,t1},{%4},{%8},{%0,%1};\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {t2,t3},{%5},{%8},{%2,%3};\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%0,%1},{%6},{%9},{t0,t1};\n"
+        "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%2,%3},{%7},{%9},{t2,t3};\n"
+        "}\n"
+        : "+r"(c[0]),"+r"(c[1]),"+r"(c[2]),"+r"(c[3])
+        : "r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b.x),"r"(b.y));
+#endif
 }
 
+
+// ---- cp.async: 16-byte async global→shared copy ----
+__device__ __forceinline__ void cp_async_16(void *dst, const void *src, bool pred) {
+    unsigned s = __cvta_generic_to_shared(dst);
+    asm volatile(
+        "{ .reg .pred p; setp.ne.b32 p,%2,0;\n"
+        "  @p cp.async.cg.shared.global [%0],[%1],16;\n"
+        "  @!p st.shared.v4.u32 [%0],{0,0,0,0}; }\n"
+        :: "r"(s),"l"(src),"r"((int)pred));
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+__device__ __forceinline__ void cp_wait(int n) {
+    if      (n == 0) asm volatile("cp.async.wait_group 0;\n");
+    else if (n == 1) asm volatile("cp.async.wait_group 1;\n");
+    else             asm volatile("cp.async.wait_group 2;\n");
+}
+
+
+// ---- Load MMA A-fragment directly from shared memory ----
+__device__ __forceinline__ uint4 load_a_frag(const uint8_t *base, int stride) {
+    int lane   = threadIdx.x % WARP_SZ;
+    int row_lo = lane / 4;
+    int row_hi = row_lo + 8;
+    int col    = (lane % 4) * 4;
+    uint4 a;
+    a.x = *(const uint32_t*)(base + row_lo * stride + col);
+    a.y = *(const uint32_t*)(base + row_hi * stride + col);
+    a.z = *(const uint32_t*)(base + row_lo * stride + 16 + col);
+    a.w = *(const uint32_t*)(base + row_hi * stride + 16 + col);
+    return a;
+}
+
+// ---- Load MMA B-fragment from shared memory ----
+__device__ __forceinline__ uint2 load_b_frag(const uint8_t *base, int stride) {
+    int lane = threadIdx.x % WARP_SZ;
+    int row  = lane / 4;
+    int col  = (lane % 4) * 4;
+    uint2 b;
+    b.x = *(const uint32_t*)(base + row * stride + col);
+    b.y = *(const uint32_t*)(base + row * stride + 16 + col);
+    return b;
+}
+
+
+// ---- Main GEMM kernel ----
+// Phase 1: __launch_bounds__(256, 2) — 128-register budget for TILES_N=16 accumulators
+// Phase 2: scales staged in SMEM alongside A/B tiles (2-cycle reads vs 20-200 cycle __ldg)
+// Phase 3: scales_A read from transposed [num_groups, M] layout (coalesced)
+// Phase 4: BLOCK_N=256 for 1.33× higher arithmetic intensity
+__global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
+    const uint8_t *__restrict__ A,
+    const uint8_t *__restrict__ B,
+    const half    *__restrict__ scales_A,  // [num_groups, M] transposed layout
+    const half    *__restrict__ scales_B,  // [N, num_groups] layout
+    half          *__restrict__ C,
+    int M, int N, int K, int group_size)
+{
+    const int bm = blockIdx.y * BLOCK_M;
+    const int bn = blockIdx.x * BLOCK_N;
+    const int tid = threadIdx.x;
+    const int warpId = tid / WARP_SZ;
+    const int laneId = tid % WARP_SZ;
+    const int halfK = K / 2;
+    const int num_groups = K / group_size;
+    const int num_k_tiles = K / BLOCK_K;
+    const int block_sz = WARP_SZ * NUM_WARPS;  // 256
+
+    // Phase 2+4: SMEM layout — A/B tiles + scale buffers per stage
+    extern __shared__ uint8_t smem[];
+    const int tileA   = BLOCK_M * SMEM_STRIDE;                    // 6144 bytes
+    const int tileB   = BLOCK_N * SMEM_STRIDE;                    // 12288 bytes (BN=256)
+    const int scalesA = SCALE_A_STRIDE * (int)sizeof(half);       // 256 bytes
+    const int scalesB = SCALE_B_STRIDE * (int)sizeof(half);       // 512 bytes (BN=256)
+    const int tileAB  = tileA + tileB + scalesA + scalesB;        // 19200 bytes/stage
+
+    uint8_t *sA[NUM_STAGES], *sB[NUM_STAGES];
+    half    *smA[NUM_STAGES], *smB[NUM_STAGES];
+    for (int i = 0; i < NUM_STAGES; i++) {
+        sA[i]  = smem + i * tileAB;
+        sB[i]  = sA[i] + tileA;
+        smA[i] = reinterpret_cast<half*>(sB[i] + tileB);
+        smB[i] = smA[i] + SCALE_A_STRIDE;
+    }
+
+    // FP32 accumulators: [n_tile][mma_half=0,1][4 values]
+    float acc[TILES_N][2][4];
+    for (int j = 0; j < TILES_N; j++)
+        for (int h = 0; h < 2; h++)
+            acc[j][h][0] = acc[j][h][1] = acc[j][h][2] = acc[j][h][3] = 0.f;
+
+    // ---- Cooperative tile loader ----
+    auto load_tile = [&](int kt, int s) {
+        int kb = kt * (BLOCK_K / 2);
+        int g_tile = (kt * BLOCK_K) / group_size;
+
+        // A tile: BLOCK_M rows × 2 halves = 256 transactions for 256 threads (1 each)
+        for (int idx = tid; idx < BLOCK_M * 2; idx += block_sz) {
+            int row = idx / 2, half_i = idx % 2;
+            bool p = (bm + row < M) && (kb + half_i * 16 < halfK);
+            cp_async_16(sA[s] + row * SMEM_STRIDE + half_i * 16,
+                        A + (size_t)(bm + row) * halfK + kb + half_i * 16, p);
+        }
+        // B tile: BLOCK_N rows × 2 halves = 512 transactions for 256 threads (2 each)
+        for (int idx = tid; idx < BLOCK_N * 2; idx += block_sz) {
+            int row = idx / 2, half_i = idx % 2;
+            bool p = (bn + row < N) && (kb + half_i * 16 < halfK);
+            cp_async_16(sB[s] + row * SMEM_STRIDE + half_i * 16,
+                        B + (size_t)(bn + row) * halfK + kb + half_i * 16, p);
+        }
+        cp_commit();
+
+        // Phase 2+3: load scale_A (transposed [num_groups, M]) into SMEM
+        if (tid < BLOCK_M) {
+            int row = bm + tid;
+            smA[s][tid] = (row < M) ? __ldg(&scales_A[g_tile * M + row])
+                                    : __float2half(0.f);
+        }
+        // Phase 2: load scale_B into SMEM (BLOCK_N threads cover all entries)
+        if (tid < BLOCK_N) {
+            int col = bn + tid;
+            smB[s][tid] = (col < N) ? __ldg(&scales_B[col * num_groups + g_tile])
+                                    : __float2half(0.f);
+        }
+        // scale stores are synchronous; __syncthreads() in K-loop ensures visibility
+    };
+
+    // Prefetch first two tiles before the loop
+    if (num_k_tiles > 0) load_tile(0, 0);
+    if (num_k_tiles > 1) load_tile(1, 1);
+
+    // ---- Main K-loop ----
+    for (int kt = 0; kt < num_k_tiles; kt++) {
+        int s = kt % NUM_STAGES;
+        if (kt + 2 < num_k_tiles)
+            load_tile(kt + 2, (kt + 2) % NUM_STAGES);
+        cp_wait(kt + 2 < num_k_tiles ? NUM_STAGES - 1 : 0);
+        __syncthreads();
+
+        int m_lo = bm + warpId * WARP_M + laneId / 4;
+        int m_hi = m_lo + 8;
+        // Phase 2: 2-cycle SMEM reads instead of 20-200 cycle __ldg
+        float sa_lo = (m_lo < M) ? __half2float(smA[s][m_lo - bm]) : 0.f;
+        float sa_hi = (m_hi < M) ? __half2float(smA[s][m_hi - bm]) : 0.f;
+
+        uint4 af = load_a_frag(sA[s] + warpId * WARP_M * SMEM_STRIDE, SMEM_STRIDE);
+
+        #pragma unroll
+        for (int nt = 0; nt < TILES_N; nt++) {
+            int n_off = nt * 16;
+
+            uint2 bf0 = load_b_frag(sB[s] + (n_off + 0) * SMEM_STRIDE, SMEM_STRIDE);
+            uint2 bf1 = load_b_frag(sB[s] + (n_off + 8) * SMEM_STRIDE, SMEM_STRIDE);
+
+            int p0[4] = {0,0,0,0}, p1[4] = {0,0,0,0};
+            mma_s4(af, bf0, p0);
+            mma_s4(af, bf1, p1);
+
+            int c0 = bn + n_off + (laneId % 4) * 2;
+            int c1 = c0 + 1, c2 = c0 + 8, c3 = c2 + 1;
+            // Phase 2: SMEM reads for scale_B (2-cycle latency)
+            float sb0 = (c0 < N) ? __half2float(smB[s][c0 - bn]) : 0.f;
+            float sb1 = (c1 < N) ? __half2float(smB[s][c1 - bn]) : 0.f;
+            float sb2 = (c2 < N) ? __half2float(smB[s][c2 - bn]) : 0.f;
+            float sb3 = (c3 < N) ? __half2float(smB[s][c3 - bn]) : 0.f;
+
+            acc[nt][0][0] += (float)p0[0] * sa_lo * sb0;
+            acc[nt][0][1] += (float)p0[1] * sa_lo * sb1;
+            acc[nt][0][2] += (float)p0[2] * sa_hi * sb0;
+            acc[nt][0][3] += (float)p0[3] * sa_hi * sb1;
+            acc[nt][1][0] += (float)p1[0] * sa_lo * sb2;
+            acc[nt][1][1] += (float)p1[1] * sa_lo * sb3;
+            acc[nt][1][2] += (float)p1[2] * sa_hi * sb2;
+            acc[nt][1][3] += (float)p1[3] * sa_hi * sb3;
+        }
+        __syncthreads();
+    }
+
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+
+    // ---- Epilogue: half2 vectorized stores ----
+    int m_lo = bm + warpId * WARP_M + laneId / 4;
+    int m_hi = m_lo + 8;
+    for (int nt = 0; nt < TILES_N; nt++) {
+        int c0 = bn + nt * 16 + (laneId % 4) * 2;
+        int c1 = c0 + 1, c2 = c0 + 8, c3 = c2 + 1;
+        if (m_lo < M) {
+            if (c0 < N && c1 < N)
+                *reinterpret_cast<half2*>(&C[m_lo * N + c0]) =
+                    __floats2half2_rn(acc[nt][0][0], acc[nt][0][1]);
+            if (c2 < N && c3 < N)
+                *reinterpret_cast<half2*>(&C[m_lo * N + c2]) =
+                    __floats2half2_rn(acc[nt][1][0], acc[nt][1][1]);
+        }
+        if (m_hi < M) {
+            if (c0 < N && c1 < N)
+                *reinterpret_cast<half2*>(&C[m_hi * N + c0]) =
+                    __floats2half2_rn(acc[nt][0][2], acc[nt][0][3]);
+            if (c2 < N && c3 < N)
+                *reinterpret_cast<half2*>(&C[m_hi * N + c2]) =
+                    __floats2half2_rn(acc[nt][1][2], acc[nt][1][3]);
+        }
+    }
+}
+
+
+// ---- Host wrapper ----
 torch::Tensor gemm_int4_custom(
-    torch::Tensor A_packed,
-    torch::Tensor B_packed,
-    torch::Tensor scales_A,
-    torch::Tensor scales_B,
-    int group_size
-) {
-    TORCH_CHECK(A_packed.is_cuda(), "A_packed must be a CUDA tensor");
-    TORCH_CHECK(B_packed.is_cuda(), "B_packed must be a CUDA tensor");
-    TORCH_CHECK(A_packed.dtype() == torch::kUInt8, "A_packed must be uint8");
-    TORCH_CHECK(B_packed.dtype() == torch::kUInt8, "B_packed must be uint8");
-    TORCH_CHECK(scales_A.dtype() == torch::kHalf, "scales_A must be float16");
-    TORCH_CHECK(scales_B.dtype() == torch::kHalf, "scales_B must be float16");
+    torch::Tensor A_packed, torch::Tensor B_packed,
+    torch::Tensor scales_A, torch::Tensor scales_B, int group_size)
+{
+    TORCH_CHECK(A_packed.is_cuda() && B_packed.is_cuda());
+    TORCH_CHECK(A_packed.dtype() == torch::kUInt8);
+    int M = A_packed.size(0), K = A_packed.size(1) * 2, N = B_packed.size(0);
 
-    int M = A_packed.size(0);
-    int K = A_packed.size(1) * 2;
-    int N = B_packed.size(0);
+    auto C = torch::zeros({M, N},
+        torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
 
-    TORCH_CHECK(B_packed.size(1) * 2 == K, "A and B must have the same K dimension");
-    TORCH_CHECK(K % group_size == 0, "K must be divisible by group_size");
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    dim3 block(WARP_SZ * NUM_WARPS);
+    // Phase 4: request 64KB dynamic SMEM (57,600 bytes needed for BN=256)
+    cudaFuncSetAttribute(
+        gemm_int4_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        65536);
+    // Phase 2+4: smem includes A/B tiles + scale buffers per stage
+    int smem = NUM_STAGES * (BLOCK_M * SMEM_STRIDE + BLOCK_N * SMEM_STRIDE
+                             + BLOCK_M * (int)sizeof(half) + BLOCK_N * (int)sizeof(half));
 
-    auto C = torch::empty({M, N}, torch::TensorOptions().dtype(torch::kHalf).device(A_packed.device()));
-
-    dim3 block(16, 16);
-    dim3 grid((N + 15) / 16, (M + 15) / 16);
-
-    gemm_int4_kernel<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
-        A_packed.data_ptr<uint8_t>(),
-        B_packed.data_ptr<uint8_t>(),
+    gemm_int4_kernel<<<grid, block, smem, at::cuda::getCurrentCUDAStream()>>>(
+        A_packed.data_ptr<uint8_t>(), B_packed.data_ptr<uint8_t>(),
         reinterpret_cast<const half*>(scales_A.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(scales_B.data_ptr<at::Half>()),
         reinterpret_cast<half*>(C.data_ptr<at::Half>()),
-        M, N, K, group_size
-    );
-
+        M, N, K, group_size);
     return C;
 }
