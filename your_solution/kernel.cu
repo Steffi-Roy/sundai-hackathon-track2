@@ -5,20 +5,16 @@
 
 // ---- Configuration ----
 static constexpr int BLOCK_M    = 128;
-static constexpr int BLOCK_N    = 256;   // Phase 4: doubled from 128
+static constexpr int BLOCK_N    = 128;
 static constexpr int BLOCK_K    = 64;
 static constexpr int WARP_SZ    = 32;
 static constexpr int NUM_WARPS  = 8;
 static constexpr int WARP_M     = BLOCK_M / NUM_WARPS;  // 16
-static constexpr int TILES_N    = BLOCK_N / 16;          // 16
+static constexpr int TILES_N    = BLOCK_N / 16;          // 8
 static constexpr int NUM_STAGES = 3;
 
 // Shared memory stride: K/2 bytes + padding (must be 16-byte aligned for cp.async)
 static constexpr int SMEM_STRIDE = BLOCK_K / 2 + 16;   // 48 bytes per row
-
-// Phase 2: scale staging constants
-static constexpr int SCALE_A_STRIDE = BLOCK_M;   // FP16 elements in smA per stage
-static constexpr int SCALE_B_STRIDE = BLOCK_N;   // FP16 elements in smB per stage
 
 // ── Quantize kernel configuration ──
 static constexpr int WARPS_PER_BLOCK_Q = 8;
@@ -26,9 +22,9 @@ static constexpr int GROUPS_PER_WARP   = 4;
 static constexpr int THREADS_PER_GROUP = WARP_SZ / GROUPS_PER_WARP;  // 8
 
 // ── Optimized activation INT4 quantization kernel ─────────────────────────
-// float4 loads (8 halves/thread), 4 groups/warp, 3-step sub-group reduction
-// Scales stored in transposed [num_groups, M] layout for coalesced GEMM reads
-// group_size must be 64 (8 threads × 8 halves)
+// float4 loads (8 halves/thread), 4 groups/warp, 3-step sub-group reduction.
+// Scales stored in transposed [num_groups, M] layout for coalesced GEMM reads.
+// group_size must be 64 (8 threads × 8 halves).
 __global__ void quantize_int4_opt_kernel(
     const half*  __restrict__ input,
     const half*  __restrict__ smooth,
@@ -205,15 +201,19 @@ __device__ __forceinline__ uint2 load_b_frag(const uint8_t *base, int stride) {
 
 
 // ---- Main GEMM kernel ----
-// Phase 1: __launch_bounds__(256, 2) — 128-register budget for TILES_N=16 accumulators
-// Phase 2: scales staged in SMEM alongside A/B tiles (2-cycle reads vs 20-200 cycle __ldg)
-// Phase 3: scales_A read from transposed [num_groups, M] layout (coalesced)
-// Phase 4: BLOCK_N=256 for 1.33× higher arithmetic intensity
-__global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
+// Baseline post-revert per CLAUDE_revert.md:
+//   - MMA m16n8k64, Triple buffering (NUM_STAGES=3), cp.async.cg
+//   - __ldg for scale reads (NO SMEM scale staging)
+//   - half2 epilogue
+//   - BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, NUM_WARPS=8
+//   - NO __launch_bounds__, NO cudaFuncSetAttribute
+// scales_A is in transposed [num_groups, M] layout produced by the quantize kernel;
+// scales_B is in [N, num_groups] layout produced by quantize.py.
+__global__ void gemm_int4_kernel(
     const uint8_t *__restrict__ A,
     const uint8_t *__restrict__ B,
-    const half    *__restrict__ scales_A,  // [num_groups, M] transposed layout
-    const half    *__restrict__ scales_B,  // [N, num_groups] layout
+    const half    *__restrict__ scales_A,  // [num_groups, M] transposed
+    const half    *__restrict__ scales_B,  // [N, num_groups]
     half          *__restrict__ C,
     int M, int N, int K, int group_size)
 {
@@ -225,23 +225,16 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
     const int halfK = K / 2;
     const int num_groups = K / group_size;
     const int num_k_tiles = K / BLOCK_K;
-    const int block_sz = WARP_SZ * NUM_WARPS;  // 256
 
-    // Phase 2+4: SMEM layout — A/B tiles + scale buffers per stage
+    // Triple-buffered shared memory (3 stages)
     extern __shared__ uint8_t smem[];
-    const int tileA   = BLOCK_M * SMEM_STRIDE;                    // 6144 bytes
-    const int tileB   = BLOCK_N * SMEM_STRIDE;                    // 12288 bytes (BN=256)
-    const int scalesA = SCALE_A_STRIDE * (int)sizeof(half);       // 256 bytes
-    const int scalesB = SCALE_B_STRIDE * (int)sizeof(half);       // 512 bytes (BN=256)
-    const int tileAB  = tileA + tileB + scalesA + scalesB;        // 19200 bytes/stage
-
+    const int tileA  = BLOCK_M * SMEM_STRIDE;
+    const int tileB  = BLOCK_N * SMEM_STRIDE;
+    const int tileAB = tileA + tileB;
     uint8_t *sA[NUM_STAGES], *sB[NUM_STAGES];
-    half    *smA[NUM_STAGES], *smB[NUM_STAGES];
     for (int i = 0; i < NUM_STAGES; i++) {
-        sA[i]  = smem + i * tileAB;
-        sB[i]  = sA[i] + tileA;
-        smA[i] = reinterpret_cast<half*>(sB[i] + tileB);
-        smB[i] = smA[i] + SCALE_A_STRIDE;
+        sA[i] = smem + i * tileAB;
+        sB[i] = smem + i * tileAB + tileA;
     }
 
     // FP32 accumulators: [n_tile][mma_half=0,1][4 values]
@@ -253,37 +246,19 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
     // ---- Cooperative tile loader ----
     auto load_tile = [&](int kt, int s) {
         int kb = kt * (BLOCK_K / 2);
-        int g_tile = (kt * BLOCK_K) / group_size;
-
-        // A tile: BLOCK_M rows × 2 halves = 256 transactions for 256 threads (1 each)
-        for (int idx = tid; idx < BLOCK_M * 2; idx += block_sz) {
-            int row = idx / 2, half_i = idx % 2;
-            bool p = (bm + row < M) && (kb + half_i * 16 < halfK);
-            cp_async_16(sA[s] + row * SMEM_STRIDE + half_i * 16,
-                        A + (size_t)(bm + row) * halfK + kb + half_i * 16, p);
+        {
+            int row = tid / 2, half = tid % 2;
+            bool p = (bm + row < M) && (kb + half * 16 < halfK);
+            cp_async_16(sA[s] + row * SMEM_STRIDE + half * 16,
+                        A + (size_t)(bm + row) * halfK + kb + half * 16, p);
         }
-        // B tile: BLOCK_N rows × 2 halves = 512 transactions for 256 threads (2 each)
-        for (int idx = tid; idx < BLOCK_N * 2; idx += block_sz) {
-            int row = idx / 2, half_i = idx % 2;
-            bool p = (bn + row < N) && (kb + half_i * 16 < halfK);
-            cp_async_16(sB[s] + row * SMEM_STRIDE + half_i * 16,
-                        B + (size_t)(bn + row) * halfK + kb + half_i * 16, p);
+        {
+            int row = tid / 2, half = tid % 2;
+            bool p = (bn + row < N) && (kb + half * 16 < halfK);
+            cp_async_16(sB[s] + row * SMEM_STRIDE + half * 16,
+                        B + (size_t)(bn + row) * halfK + kb + half * 16, p);
         }
         cp_commit();
-
-        // Phase 2+3: load scale_A (transposed [num_groups, M]) into SMEM
-        if (tid < BLOCK_M) {
-            int row = bm + tid;
-            smA[s][tid] = (row < M) ? __ldg(&scales_A[g_tile * M + row])
-                                    : __float2half(0.f);
-        }
-        // Phase 2: load scale_B into SMEM (BLOCK_N threads cover all entries)
-        if (tid < BLOCK_N) {
-            int col = bn + tid;
-            smB[s][tid] = (col < N) ? __ldg(&scales_B[col * num_groups + g_tile])
-                                    : __float2half(0.f);
-        }
-        // scale stores are synchronous; __syncthreads() in K-loop ensures visibility
     };
 
     // Prefetch first two tiles before the loop
@@ -298,11 +273,13 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
         cp_wait(kt + 2 < num_k_tiles ? NUM_STAGES - 1 : 0);
         __syncthreads();
 
+        int g = (kt * BLOCK_K) / group_size;
+
         int m_lo = bm + warpId * WARP_M + laneId / 4;
         int m_hi = m_lo + 8;
-        // Phase 2: 2-cycle SMEM reads instead of 20-200 cycle __ldg
-        float sa_lo = (m_lo < M) ? __half2float(smA[s][m_lo - bm]) : 0.f;
-        float sa_hi = (m_hi < M) ? __half2float(smA[s][m_hi - bm]) : 0.f;
+        // scales_A is [num_groups, M] transposed — read as scales_A[g*M + m]
+        float sa_lo = (m_lo < M) ? __half2float(__ldg(&scales_A[g * M + m_lo])) : 0.f;
+        float sa_hi = (m_hi < M) ? __half2float(__ldg(&scales_A[g * M + m_hi])) : 0.f;
 
         uint4 af = load_a_frag(sA[s] + warpId * WARP_M * SMEM_STRIDE, SMEM_STRIDE);
 
@@ -318,12 +295,14 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
             mma_s4(af, bf1, p1);
 
             int c0 = bn + n_off + (laneId % 4) * 2;
-            int c1 = c0 + 1, c2 = c0 + 8, c3 = c2 + 1;
-            // Phase 2: SMEM reads for scale_B (2-cycle latency)
-            float sb0 = (c0 < N) ? __half2float(smB[s][c0 - bn]) : 0.f;
-            float sb1 = (c1 < N) ? __half2float(smB[s][c1 - bn]) : 0.f;
-            float sb2 = (c2 < N) ? __half2float(smB[s][c2 - bn]) : 0.f;
-            float sb3 = (c3 < N) ? __half2float(smB[s][c3 - bn]) : 0.f;
+            int c1 = c0 + 1;
+            int c2 = c0 + 8;
+            int c3 = c2 + 1;
+            // scales_B is [N, num_groups] — read as scales_B[n*num_groups + g]
+            float sb0 = (c0 < N) ? __half2float(__ldg(&scales_B[c0 * num_groups + g])) : 0.f;
+            float sb1 = (c1 < N) ? __half2float(__ldg(&scales_B[c1 * num_groups + g])) : 0.f;
+            float sb2 = (c2 < N) ? __half2float(__ldg(&scales_B[c2 * num_groups + g])) : 0.f;
+            float sb3 = (c3 < N) ? __half2float(__ldg(&scales_B[c3 * num_groups + g])) : 0.f;
 
             acc[nt][0][0] += (float)p0[0] * sa_lo * sb0;
             acc[nt][0][1] += (float)p0[1] * sa_lo * sb1;
@@ -337,6 +316,7 @@ __global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
         __syncthreads();
     }
 
+    // Flush any remaining outstanding async copies before epilogue
     asm volatile("cp.async.wait_group 0;\n");
     __syncthreads();
 
@@ -380,14 +360,8 @@ torch::Tensor gemm_int4_custom(
 
     dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
     dim3 block(WARP_SZ * NUM_WARPS);
-    // Phase 4: request 64KB dynamic SMEM (57,600 bytes needed for BN=256)
-    cudaFuncSetAttribute(
-        gemm_int4_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        65536);
-    // Phase 2+4: smem includes A/B tiles + scale buffers per stage
-    int smem = NUM_STAGES * (BLOCK_M * SMEM_STRIDE + BLOCK_N * SMEM_STRIDE
-                             + BLOCK_M * (int)sizeof(half) + BLOCK_N * (int)sizeof(half));
+    // Triple-buffered shared memory (A/B tiles only — no SMEM scale staging)
+    int smem = NUM_STAGES * (BLOCK_M * SMEM_STRIDE + BLOCK_N * SMEM_STRIDE);
 
     gemm_int4_kernel<<<grid, block, smem, at::cuda::getCurrentCUDAStream()>>>(
         A_packed.data_ptr<uint8_t>(), B_packed.data_ptr<uint8_t>(),
