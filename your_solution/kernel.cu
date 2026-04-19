@@ -209,7 +209,7 @@ __device__ __forceinline__ uint2 load_b_frag(const uint8_t *base, int stride) {
 //   - NO __launch_bounds__, NO cudaFuncSetAttribute
 // scales_A is in transposed [num_groups, M] layout produced by the quantize kernel;
 // scales_B is in [N, num_groups] layout produced by quantize.py.
-__global__ void gemm_int4_kernel(
+__global__ __launch_bounds__(256, 2) void gemm_int4_kernel(
     const uint8_t *__restrict__ A,
     const uint8_t *__restrict__ B,
     const half    *__restrict__ scales_A,  // [num_groups, M] transposed
